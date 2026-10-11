@@ -300,6 +300,44 @@ def _pct_change(series, bars):
     return None
 
 
+def _google_news(symbol, limit=5):
+    """Googleニュース検索（日本語RSS）から見出しを取得し、[(日付, 見出し, 配信元)] を返す。"""
+    import urllib.request
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+
+    s = symbol.strip().upper()
+    if s.isdigit():
+        s += ".T"
+    code = s.split(".")[0]
+    name = _PEER_NAMES.get(s)
+    query = f"{name} 株" if name else f"{code} 株価"
+    url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query) + "&hl=ja&gl=JP&ceid=JP:ja"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = resp.read()
+    root = ET.fromstring(data)
+
+    seen, heads = set(), []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        srcname = (it.findtext("source") or "").strip()
+        if srcname and title.endswith(" - " + srcname):
+            title = title[: -len(" - " + srcname)].strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        date = ""
+        try:
+            date = parsedate_to_datetime(it.findtext("pubDate")).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        heads.append((date, title, srcname))
+    heads.sort(key=lambda h: h[0], reverse=True)
+    return heads[:limit]
+
+
 def fetch_market_news(symbol):
     """(ニュース・市場データの辞書, 失敗理由) を返す。例外は外に出さない。"""
     import time
@@ -312,13 +350,23 @@ def fetch_market_news(symbol):
         return {}, f"yfinanceを読み込めませんでした（{type(exc).__name__}）"
 
     out, errors = {}, []
+    heads, source = [], ""
     try:
-        items = yf.Ticker(symbol).news or []
-        heads = [h for h in (_parse_headline(i) for i in items) if h]
-        heads.sort(key=lambda h: h[0], reverse=True)
-        out["headlines"] = heads[:5]
+        heads = _google_news(symbol)
+        source = "Googleニュース検索"
     except Exception as exc:
-        errors.append(f"ニュース取得失敗（{type(exc).__name__}）")
+        errors.append(f"Googleニュース取得失敗（{type(exc).__name__}）")
+    if not heads:
+        try:
+            items = yf.Ticker(symbol).news or []
+            heads = [h for h in (_parse_headline(i) for i in items) if h]
+            heads.sort(key=lambda h: h[0], reverse=True)
+            heads = heads[:5]
+            source = "Yahoo Finance"
+        except Exception as exc:
+            errors.append(f"Yahooニュース取得失敗（{type(exc).__name__}）")
+    out["headlines"] = heads
+    out["headline_source"] = source
 
     try:
         fx = yf.Ticker("JPY=X").history(period="3mo")["Close"].dropna()
@@ -364,7 +412,7 @@ def _news_agent(ctx, news, err=""):
             lines.append(f"日経平均は1か月で{news['nikkei_1m']:+.1f}%")
     heads = news.get("headlines") or []
     if heads:
-        lines.append("直近のニュース見出し（Yahoo Finance、点数には含めていません）：")
+        lines.append(f"直近のニュース見出し（{news.get('headline_source') or '取得元不明'}の検索結果。銘柄と無関係な記事が混じることがあります。点数には含めていません）：")
         for date, title, prov in heads:
             lines.append(f"・{title}（{prov}、{date}）" if prov else f"・{title}（{date}）")
     else:
