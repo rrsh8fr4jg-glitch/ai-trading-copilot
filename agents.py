@@ -234,7 +234,10 @@ def fetch_fundamentals(symbol):
         try:
             gname, me, syms = _peer_group(symbol)
             if gname:
-                peers = _peer_margins([s for s in syms if s != me])
+                all_peers = _peer_margins([s for s in syms if s != me])
+                # マイナス（営業赤字）の会社は比較から除外する
+                peers = {s: m for s, m in all_peers.items() if m >= 0}
+                excluded = {s: m for s, m in all_peers.items() if m < 0}
                 if len(peers) >= 3:
                     vals = sorted(peers.values())
                     out["peerGroup"] = gname
@@ -247,6 +250,10 @@ def fetch_fundamentals(symbol):
                     out["peerDetail"] = "、".join(
                         f"{_PEER_NAMES.get(s, s)} {m * 100:.1f}%"
                         for s, m in sorted(peers.items(), key=lambda kv: -kv[1]))
+                    if excluded:
+                        out["peerExcluded"] = "、".join(
+                            f"{_PEER_NAMES.get(s, s)} {m * 100:.1f}%"
+                            for s, m in sorted(excluded.items(), key=lambda kv: -kv[1]))
         except Exception:
             pass
 
@@ -275,7 +282,7 @@ def _fund_agent(f, err=""):
     if v is not None and "peerMedianMargin" in f:
         med = f["peerMedianMargin"]
         n = int(f["peerCount"])
-        shown = f"{pct(v)}（{f['peerGroup']}・取得できた{n + 1}社中{int(f['peerRank'])}位、中央値{pct(med)}）"
+        shown = f"{pct(v)}（{f['peerGroup']}・黒字の{n + 1}社中{int(f['peerRank'])}位、中央値{pct(med)}）"
         rows.append(("営業利益率", shown, v >= med, "同業中央値以上で良好"))
     else:
         rows.append(("営業利益率", pct(v) if v is not None else None, None if v is None else v >= 0.10, "10%以上で良好（同業比較なし）"))
@@ -306,7 +313,9 @@ def _fund_agent(f, err=""):
     if "peerDomesticMedian" in f:
         ref_text += f"国内メーカーのみの中央値は{pct(f['peerDomesticMedian'])}。"
     if f.get("peerDetail"):
-        ref_text += f"他社の営業利益率：{f['peerDetail']}。"
+        ref_text += f"比較に使った他社の営業利益率：{f['peerDetail']}。"
+    if f.get("peerExcluded"):
+        ref_text += f"営業赤字のため比較から除外：{f['peerExcluded']}。"
 
     evaluable = [ok for _, _, ok, _ in rows if ok is not None]
     passed = sum(1 for ok in evaluable if ok)
