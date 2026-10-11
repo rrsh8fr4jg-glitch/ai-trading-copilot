@@ -48,27 +48,111 @@ _FUND_KEYS = [
 ]
 
 
+_FUND_CACHE = {}
+_FUND_TTL = 3600  # 秒
+
+
+def _ok(v):
+    return isinstance(v, (int, float, np.floating)) and np.isfinite(v)
+
+
+def _val(df, names, col):
+    """決算書DataFrameから、指定列(期)の値を項目名の候補順に探す。"""
+    if df is None or getattr(df, "empty", True):
+        return None
+    for n in names:
+        if n in df.index:
+            try:
+                v = df.at[n, col]
+            except Exception:
+                continue
+            if _ok(v):
+                return float(v)
+    return None
+
+
 def fetch_fundamentals(symbol):
-    """財務指標を取得。失敗しても例外は出さず、空の辞書を返す。"""
+    """財務指標を取得して (指標の辞書, 失敗理由) を返す。例外は外に出さない。"""
+    import time
+    cached = _FUND_CACHE.get(symbol)
+    if cached and time.time() - cached[0] < _FUND_TTL:
+        return cached[1], ""
+
     try:
         import yfinance as yf
-        info = yf.Ticker(symbol).info or {}
-    except Exception:
-        return {}
-    out = {}
-    for k in _FUND_KEYS:
-        v = info.get(k)
-        if isinstance(v, (int, float)) and np.isfinite(v):
-            out[k] = float(v)
-    return out
+        t = yf.Ticker(symbol)
+    except Exception as exc:
+        return {}, f"yfinanceを読み込めませんでした（{type(exc).__name__}）"
+
+    out, errors = {}, []
+
+    # (1) info から取得
+    try:
+        info = t.info or {}
+        for k in _FUND_KEYS:
+            v = info.get(k)
+            if _ok(v):
+                out[k] = float(v)
+    except Exception as exc:
+        errors.append(f"info取得失敗（{type(exc).__name__}）")
+
+    # (2) 足りない項目は決算書から計算して補う
+    try:
+        fin = t.financials
+        if fin is not None and not fin.empty:
+            c0 = fin.columns[0]
+            rev0 = _val(fin, ["Total Revenue", "Operating Revenue"], c0)
+            op0 = _val(fin, ["Operating Income", "Total Operating Income As Reported"], c0)
+            ni0 = _val(fin, ["Net Income", "Net Income Common Stockholders"], c0)
+            if "operatingMargins" not in out and rev0 and op0 is not None:
+                out["operatingMargins"] = op0 / rev0
+            if len(fin.columns) >= 2:
+                c1 = fin.columns[1]
+                rev1 = _val(fin, ["Total Revenue", "Operating Revenue"], c1)
+                ni1 = _val(fin, ["Net Income", "Net Income Common Stockholders"], c1)
+                if "revenueGrowth" not in out and rev0 is not None and rev1:
+                    out["revenueGrowth"] = rev0 / rev1 - 1
+                if "earningsGrowth" not in out and ni0 is not None and ni1 and ni1 > 0:
+                    out["earningsGrowth"] = ni0 / ni1 - 1
+            if "returnOnEquity" not in out and ni0 is not None:
+                bs = t.balance_sheet
+                if bs is not None and not bs.empty:
+                    eq = _val(bs, ["Stockholders Equity", "Common Stock Equity",
+                                   "Total Equity Gross Minority Interest"], bs.columns[0])
+                    if eq and eq > 0:
+                        out["returnOnEquity"] = ni0 / eq
+    except Exception as exc:
+        errors.append(f"損益計算書の取得失敗（{type(exc).__name__}）")
+
+    try:
+        if "freeCashflow" not in out:
+            cf = t.cashflow
+            if cf is not None and not cf.empty:
+                c0 = cf.columns[0]
+                fcf = _val(cf, ["Free Cash Flow"], c0)
+                if fcf is None:
+                    ocf = _val(cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], c0)
+                    capex = _val(cf, ["Capital Expenditure"], c0)
+                    if ocf is not None and capex is not None:
+                        fcf = ocf + capex  # capexは通常マイナス
+                if fcf is not None:
+                    out["freeCashflow"] = fcf
+    except Exception as exc:
+        errors.append(f"キャッシュフローの取得失敗（{type(exc).__name__}）")
+
+    if out:
+        _FUND_CACHE[symbol] = (time.time(), out)
+        return out, ""
+    reason = "、".join(errors) if errors else "Yahoo Financeに財務データがありませんでした"
+    return {}, reason
 
 
-def _fund_agent(f):
+def _fund_agent(f, err=""):
     if not f:
         return {
             "name": "② 企業分析",
             "signal": "データ不足",
-            "finding": "Yahoo Financeから財務指標を取得できませんでした。時間をおいて再実行するか、決算短信で売上・営業利益率・EPS・フリーキャッシュフローを確認してください。",
+            "finding": "Yahoo Financeから財務指標を取得できませんでした。" + (f"理由：{err}。" if err else "") + "時間をおいて再実行するか、決算短信で売上・営業利益率・EPS・フリーキャッシュフローを確認してください。",
             "score": None,
         }
 
@@ -82,9 +166,9 @@ def _fund_agent(f):
     v = f.get("returnOnEquity")
     rows.append(("ROE", pct(v) if v is not None else None, None if v is None else v >= 0.08, "8%以上で良好"))
     v = f.get("revenueGrowth")
-    rows.append(("売上成長率(前年同期比)", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
+    rows.append(("売上成長率", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
     v = f.get("earningsGrowth")
-    rows.append(("利益成長率(前年同期比)", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
+    rows.append(("利益成長率", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
     v = f.get("freeCashflow")
     rows.append(("フリーCF", f"{v / 1e8:,.0f}億円" if v is not None else None, None if v is None else v > 0, "プラスで良好"))
 
@@ -166,9 +250,9 @@ def _tech_agent(ctx):
     return {"name": "① テクニカル分析", "signal": sig, "finding": "。".join(notes) + "。"}
 
 
-def _rule_agents(ctx, fund=None):
+def _rule_agents(ctx, fund=None, fund_err=""):
     tech = _tech_agent(ctx)
-    corp = _fund_agent(fund or {})
+    corp = _fund_agent(fund or {}, fund_err)
     tech_signal, corp_signal = tech["signal"], corp["signal"]
 
     # 総合判断：テクニカルが強気でも、企業分析が「懸念」なら購入候補にしない
@@ -215,8 +299,8 @@ def _rule_agents(ctx, fund=None):
 
 
 def run_agents(ctx, df, api_key=""):
-    fund = fetch_fundamentals(ctx["symbol"])
-    result = _rule_agents(ctx, fund)
+    fund, fund_err = fetch_fundamentals(ctx["symbol"])
+    result = _rule_agents(ctx, fund, fund_err)
     if not api_key:
         return result
     try:
@@ -248,3 +332,4 @@ MACDシグナル: {ctx['macd_signal']}
     except Exception as exc:
         result["summary"] += f"（AIコメント取得に失敗したため、ルール判定を表示しています：{type(exc).__name__}）"
     return result
+
