@@ -100,24 +100,31 @@ def _peer_group(symbol):
     return None, s, []
 
 
+def _cols_desc(df):
+    try:
+        return sorted(df.columns, reverse=True)
+    except Exception:
+        return list(df.columns)
+
+
 def _operating_margin_of(sym):
-    """1銘柄の営業利益率。infoを優先し、だめなら決算書から計算。"""
+    """1銘柄の営業利益率（通期）。決算書から計算し、だめならinfoで代替。"""
     try:
         import yfinance as yf
         t = yf.Ticker(sym)
         try:
-            v = (t.info or {}).get("operatingMargins")
-            if _ok(v):
-                return float(v)
+            fin = t.financials
+            if fin is not None and not fin.empty:
+                c0 = _cols_desc(fin)[0]
+                rev = _val(fin, ["Total Revenue", "Operating Revenue"], c0)
+                op = _val(fin, ["Operating Income", "Total Operating Income As Reported"], c0)
+                if rev and op is not None:
+                    return op / rev
         except Exception:
             pass
-        fin = t.financials
-        if fin is not None and not fin.empty:
-            c0 = fin.columns[0]
-            rev = _val(fin, ["Total Revenue", "Operating Revenue"], c0)
-            op = _val(fin, ["Operating Income", "Total Operating Income As Reported"], c0)
-            if rev and op is not None:
-                return op / rev
+        v = (t.info or {}).get("operatingMargins")
+        if _ok(v):
+            return float(v)
     except Exception:
         pass
     return None
@@ -144,7 +151,8 @@ def _peer_margins(syms):
 
 
 def fetch_fundamentals(symbol):
-    """財務指標を取得して (指標の辞書, 失敗理由) を返す。例外は外に出さない。"""
+    """財務指標を取得して (指標の辞書, 失敗理由) を返す。例外は外に出さない。
+    通期（直近の決算期）の決算書を優先し、足りない項目だけYahooのinfoで補う。"""
     import time
     cached = _FUND_CACHE.get(symbol)
     if cached and time.time() - cached[0] < _FUND_TTL:
@@ -158,61 +166,70 @@ def fetch_fundamentals(symbol):
 
     out, errors = {}, []
 
-    # (1) info から取得
-    try:
-        info = t.info or {}
-        for k in _FUND_KEYS:
-            v = info.get(k)
-            if _ok(v):
-                out[k] = float(v)
-    except Exception as exc:
-        errors.append(f"info取得失敗（{type(exc).__name__}）")
-
-    # (2) 足りない項目は決算書から計算して補う
+    # (1) 通期の決算書から計算
     try:
         fin = t.financials
         if fin is not None and not fin.empty:
-            c0 = fin.columns[0]
+            cols = _cols_desc(fin)
+            c0 = cols[0]
             rev0 = _val(fin, ["Total Revenue", "Operating Revenue"], c0)
             op0 = _val(fin, ["Operating Income", "Total Operating Income As Reported"], c0)
             ni0 = _val(fin, ["Net Income", "Net Income Common Stockholders"], c0)
-            if "operatingMargins" not in out and rev0 and op0 is not None:
+            try:
+                out["fiscalLabel"] = f"{c0.year}年{c0.month}月期"
+            except Exception:
+                pass
+            if rev0 and op0 is not None:
                 out["operatingMargins"] = op0 / rev0
-            if len(fin.columns) >= 2:
-                c1 = fin.columns[1]
+            if len(cols) >= 2:
+                c1 = cols[1]
                 rev1 = _val(fin, ["Total Revenue", "Operating Revenue"], c1)
                 ni1 = _val(fin, ["Net Income", "Net Income Common Stockholders"], c1)
-                if "revenueGrowth" not in out and rev0 is not None and rev1:
+                if rev0 is not None and rev1:
                     out["revenueGrowth"] = rev0 / rev1 - 1
-                if "earningsGrowth" not in out and ni0 is not None and ni1 and ni1 > 0:
+                if ni0 is not None and ni1 and ni1 > 0:
                     out["earningsGrowth"] = ni0 / ni1 - 1
-            if "returnOnEquity" not in out and ni0 is not None:
+            if ni0 is not None:
                 bs = t.balance_sheet
                 if bs is not None and not bs.empty:
                     eq = _val(bs, ["Stockholders Equity", "Common Stock Equity",
-                                   "Total Equity Gross Minority Interest"], bs.columns[0])
+                                   "Total Equity Gross Minority Interest"], _cols_desc(bs)[0])
                     if eq and eq > 0:
                         out["returnOnEquity"] = ni0 / eq
     except Exception as exc:
         errors.append(f"損益計算書の取得失敗（{type(exc).__name__}）")
 
     try:
-        if "freeCashflow" not in out:
-            cf = t.cashflow
-            if cf is not None and not cf.empty:
-                c0 = cf.columns[0]
-                fcf = _val(cf, ["Free Cash Flow"], c0)
-                if fcf is None:
-                    ocf = _val(cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], c0)
-                    capex = _val(cf, ["Capital Expenditure"], c0)
-                    if ocf is not None and capex is not None:
-                        fcf = ocf + capex  # capexは通常マイナス
-                if fcf is not None:
-                    out["freeCashflow"] = fcf
+        cf = t.cashflow
+        if cf is not None and not cf.empty:
+            c0 = _cols_desc(cf)[0]
+            fcf = _val(cf, ["Free Cash Flow"], c0)
+            if fcf is None:
+                ocf = _val(cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], c0)
+                capex = _val(cf, ["Capital Expenditure"], c0)
+                if ocf is not None and capex is not None:
+                    fcf = ocf + capex  # capexは通常マイナス
+            if fcf is not None:
+                out["freeCashflow"] = fcf
     except Exception as exc:
         errors.append(f"キャッシュフローの取得失敗（{type(exc).__name__}）")
 
-    # (3) 同業他社との営業利益率比較
+    # (2) 足りない項目はinfoで補完（直近四半期ベースが混じる）
+    filled_from_info = []
+    try:
+        info = t.info or {}
+        for k in _FUND_KEYS:
+            v = info.get(k)
+            if k not in out and _ok(v):
+                out[k] = float(v)
+                if k in ("operatingMargins", "returnOnEquity", "revenueGrowth", "earningsGrowth", "freeCashflow"):
+                    filled_from_info.append(k)
+    except Exception as exc:
+        errors.append(f"info取得失敗（{type(exc).__name__}）")
+    if filled_from_info:
+        out["infoFilled"] = "、".join(filled_from_info)
+
+    # (3) 同業他社との営業利益率比較（他社も通期）
     if "operatingMargins" in out:
         try:
             gname, me, syms = _peer_group(symbol)
@@ -265,9 +282,9 @@ def _fund_agent(f, err=""):
     v = f.get("returnOnEquity")
     rows.append(("ROE", pct(v) if v is not None else None, None if v is None else v >= 0.08, "8%以上で良好"))
     v = f.get("revenueGrowth")
-    rows.append(("売上成長率", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
+    rows.append(("売上成長率(前期比)", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
     v = f.get("earningsGrowth")
-    rows.append(("利益成長率", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
+    rows.append(("利益成長率(前期比)", pct(v) if v is not None else None, None if v is None else v > 0, "プラスで良好"))
     v = f.get("freeCashflow")
     rows.append(("フリーCF", f"{v / 1e8:,.0f}億円" if v is not None else None, None if v is None else v > 0, "プラスで良好"))
 
@@ -299,7 +316,10 @@ def _fund_agent(f, err=""):
         ratio = passed / len(evaluable)
         signal = "良好" if ratio >= 0.6 else ("中立" if ratio >= 0.4 else "懸念")
 
-    finding = "、".join(notes) + "。" + ref_text
+    basis = f"通期（{f['fiscalLabel']}）ベース。" if f.get("fiscalLabel") else ""
+    if f.get("infoFilled"):
+        ref_text += f"（注：一部項目は決算書を取得できず、直近四半期ベースの値で代替しています）"
+    finding = basis + "、".join(notes) + "。" + ref_text
     finding += f"（評価できた{len(evaluable)}項目中{passed}項目が基準を満たしました。基準は簡易的な目安です）"
     return {"name": "② 企業分析", "signal": signal, "finding": finding, "score": (passed, len(evaluable))}
 
