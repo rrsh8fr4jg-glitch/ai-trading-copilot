@@ -264,6 +264,114 @@ def fetch_fundamentals(symbol):
     return {}, reason
 
 
+# ---------------------------------------------------------------
+# ニュース・市場（見出しと為替・日経平均。点数化はしない参考表示）
+# ---------------------------------------------------------------
+_NEWS_CACHE = {}
+_NEWS_TTL = 1800  # 秒
+
+
+def _parse_headline(it):
+    """yfinanceのニュース1件を (日付, 見出し, 配信元) に直す。形式が変わっても落ちないようにする。"""
+    if not isinstance(it, dict):
+        return None
+    c = it.get("content") if isinstance(it.get("content"), dict) else None
+    if c:
+        title = c.get("title")
+        date = str(c.get("pubDate") or c.get("displayTime") or "")[:10]
+        prov = (c.get("provider") or {}).get("displayName") if isinstance(c.get("provider"), dict) else ""
+    else:
+        title = it.get("title")
+        prov = it.get("publisher") or ""
+        ts = it.get("providerPublishTime")
+        date = ""
+        if isinstance(ts, (int, float)):
+            import datetime
+            date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    if not title:
+        return None
+    return (date, str(title).strip(), str(prov or "").strip())
+
+
+def _pct_change(series, bars):
+    s = series.dropna()
+    if len(s) > bars:
+        return float(s.iloc[-1] / s.iloc[-1 - bars] - 1) * 100
+    return None
+
+
+def fetch_market_news(symbol):
+    """(ニュース・市場データの辞書, 失敗理由) を返す。例外は外に出さない。"""
+    import time
+    cached = _NEWS_CACHE.get(symbol)
+    if cached and time.time() - cached[0] < _NEWS_TTL:
+        return cached[1], ""
+    try:
+        import yfinance as yf
+    except Exception as exc:
+        return {}, f"yfinanceを読み込めませんでした（{type(exc).__name__}）"
+
+    out, errors = {}, []
+    try:
+        items = yf.Ticker(symbol).news or []
+        heads = [h for h in (_parse_headline(i) for i in items) if h]
+        heads.sort(key=lambda h: h[0], reverse=True)
+        out["headlines"] = heads[:5]
+    except Exception as exc:
+        errors.append(f"ニュース取得失敗（{type(exc).__name__}）")
+
+    try:
+        fx = yf.Ticker("JPY=X").history(period="3mo")["Close"].dropna()
+        if len(fx) > 21:
+            out["usdjpy"] = float(fx.iloc[-1])
+            out["usdjpy_1m"] = _pct_change(fx, 21)
+    except Exception as exc:
+        errors.append(f"為替取得失敗（{type(exc).__name__}）")
+
+    try:
+        nk = yf.Ticker("^N225").history(period="3mo")["Close"].dropna()
+        if len(nk) > 21:
+            out["nikkei_1m"] = _pct_change(nk, 21)
+    except Exception as exc:
+        errors.append(f"日経平均取得失敗（{type(exc).__name__}）")
+
+    has_data = bool(out.get("headlines")) or out.get("usdjpy") is not None or out.get("nikkei_1m") is not None
+    if has_data:
+        _NEWS_CACHE[symbol] = (time.time(), out)
+        return out, ""
+    return {}, "、".join(errors) if errors else "ニュース・市場データがありませんでした"
+
+
+def _news_agent(ctx, news, err=""):
+    if not news:
+        return {
+            "name": "③ ニュース・市場分析",
+            "signal": "データ不足",
+            "finding": "ニュース・市場データを取得できませんでした。" + (f"理由：{err}。" if err else "") + "決算、為替、金利、関税などの材料は別途確認してください。",
+        }
+    lines = []
+    if news.get("usdjpy") is not None:
+        d = news.get("usdjpy_1m")
+        if d is None:
+            lines.append(f"ドル円：{news['usdjpy']:.2f}円")
+        else:
+            lines.append(f"ドル円：{news['usdjpy']:.2f}円（1か月で{d:+.1f}%、{'円安' if d > 0 else '円高'}方向）。輸出企業は円安が追い風、円高が逆風になりやすい")
+    if news.get("nikkei_1m") is not None:
+        r1 = ctx.get("return_1m")
+        if isinstance(r1, float) and np.isfinite(r1):
+            lines.append(f"日経平均は1か月で{news['nikkei_1m']:+.1f}%、この銘柄は{r1:+.1f}%")
+        else:
+            lines.append(f"日経平均は1か月で{news['nikkei_1m']:+.1f}%")
+    heads = news.get("headlines") or []
+    if heads:
+        lines.append("直近のニュース見出し（Yahoo Finance、点数には含めていません）：")
+        for date, title, prov in heads:
+            lines.append(f"・{title}（{prov}、{date}）" if prov else f"・{title}（{date}）")
+    else:
+        lines.append("この銘柄のニュース見出しは取得できませんでした。")
+    return {"name": "③ ニュース・市場分析", "signal": "参考情報", "finding": "\n\n".join(lines)}
+
+
 def _fund_agent(f, err=""):
     if not f:
         return {
@@ -382,7 +490,7 @@ def _tech_agent(ctx):
     return {"name": "① テクニカル分析", "signal": sig, "finding": "。".join(notes) + "。"}
 
 
-def _rule_agents(ctx, fund=None, fund_err=""):
+def _rule_agents(ctx, fund=None, fund_err="", news=None, news_err=""):
     tech = _tech_agent(ctx)
     corp = _fund_agent(fund or {}, fund_err)
     tech_signal, corp_signal = tech["signal"], corp["signal"]
@@ -402,7 +510,7 @@ def _rule_agents(ctx, fund=None, fund_err=""):
     agents = [
         tech,
         {k: v for k, v in corp.items() if k != "score"},
-        {"name": "③ ニュース・市場分析", "signal": "未接続", "finding": "この初期版ではニュースの網羅的な取得・真偽判定を行っていません。決算、為替、金利、自動車関税などの材料を確認してください。"},
+        _news_agent(ctx, news, news_err),
         {"name": "④ リスク管理", "signal": "中程度" if ctx["risk"] == "中程度" else ctx["risk"], "finding": f"仮想資金は{ctx['capital']:,}円。単一銘柄への集中、決算発表時の急変、円高・円安の影響に注意。購入数量は資金の20%を上限に試算します。"},
     ]
     corp_note = {
@@ -411,7 +519,7 @@ def _rule_agents(ctx, fund=None, fund_err=""):
         "懸念": "企業分析で懸念あり（購入候補は見送り）",
         "データ不足": "企業分析は財務データ不足のため未評価",
     }[corp_signal]
-    final_text = f"テクニカルは{tech_signal}、{corp_note}。ニュース確認は未実装のため、単独で売買判断に使わないでください。"
+    final_text = f"テクニカルは{tech_signal}、{corp_note}。ニュース・市場は参考表示のみで判定には含めていません。単独で売買判断に使わないでください。"
     agents.append({"name": "⑤ 最終判断", "signal": verdict, "finding": final_text})
 
     max_amount = int(ctx["capital"] * 0.20)
@@ -432,16 +540,18 @@ def _rule_agents(ctx, fund=None, fund_err=""):
 
 def run_agents(ctx, df, api_key=""):
     fund, fund_err = fetch_fundamentals(ctx["symbol"])
-    result = _rule_agents(ctx, fund, fund_err)
+    news, news_err = fetch_market_news(ctx["symbol"])
+    result = _rule_agents(ctx, fund, fund_err, news, news_err)
     if not api_key:
         return result
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         corp = next(a for a in result["agents"] if a["name"].startswith("② "))
+        news_text = next(a for a in result["agents"] if a["name"].startswith("③ "))["finding"]
         prompt = f"""
 あなたは日本株の投資リサーチ補助AIです。断定的な利益保証や、実際の発注指示はしないでください。
-次の数値だけを根拠に、簡潔な日本語で暫定判断を説明してください。ニュースはデータ未提供なので「未評価」と明記してください。
+次の数値と見出しだけを根拠に、簡潔な日本語で暫定判断を説明してください。ニュースは見出しのみで内容は未確認なので、見出しから断定せず「見出しのみ」と明記してください。見出しが無い場合は「ニュースは未評価」と明記してください。
 企業分析が「データ不足」の場合は、その旨も明記してください。
 銘柄: {ctx['symbol']}
 終値: {ctx['last_price']:.2f}
@@ -453,6 +563,7 @@ MACDシグナル: {ctx['macd_signal']}
 1か月騰落率(%): {ctx['return_1m']}
 3か月騰落率(%): {ctx['return_3m']}
 企業分析（{corp['signal']}）: {corp['finding']}
+ニュース・市場: {news_text}
 資金: {ctx['capital']}円、リスク許容度: {ctx['risk']}、期間: {ctx['horizon']}
 既存のルール判定: {result['verdict']}
 """
