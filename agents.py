@@ -71,6 +71,78 @@ def _val(df, names, col):
     return None
 
 
+_PEER_GROUPS = {
+    "世界の主要自動車メーカー": [
+        # 国内
+        "7203.T", "7267.T", "7201.T", "7269.T", "7270.T", "7261.T", "7202.T", "7211.T", "7272.T",
+        # 海外（米・欧・韓・中）
+        "F", "GM", "TSLA", "STLA", "VOW3.DE", "MBG.DE", "BMW.DE", "RNO.PA",
+        "005380.KS", "000270.KS", "1211.HK",
+    ],
+}
+_PEER_NAMES = {
+    "7203.T": "トヨタ", "7267.T": "ホンダ", "7201.T": "日産", "7269.T": "スズキ", "7270.T": "SUBARU",
+    "7261.T": "マツダ", "7202.T": "いすゞ", "7211.T": "三菱自", "7272.T": "ヤマハ発",
+    "F": "フォード", "GM": "GM", "TSLA": "テスラ", "STLA": "ステランティス", "VOW3.DE": "VW",
+    "MBG.DE": "メルセデス", "BMW.DE": "BMW", "RNO.PA": "ルノー",
+    "005380.KS": "現代自", "000270.KS": "起亜", "1211.HK": "BYD",
+}
+_PEER_CACHE = {}
+
+
+def _peer_group(symbol):
+    s = symbol.strip().upper()
+    if s.isdigit():
+        s += ".T"
+    for name, syms in _PEER_GROUPS.items():
+        if s in syms:
+            return name, s, syms
+    return None, s, []
+
+
+def _operating_margin_of(sym):
+    """1銘柄の営業利益率。infoを優先し、だめなら決算書から計算。"""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(sym)
+        try:
+            v = (t.info or {}).get("operatingMargins")
+            if _ok(v):
+                return float(v)
+        except Exception:
+            pass
+        fin = t.financials
+        if fin is not None and not fin.empty:
+            c0 = fin.columns[0]
+            rev = _val(fin, ["Total Revenue", "Operating Revenue"], c0)
+            op = _val(fin, ["Operating Income", "Total Operating Income As Reported"], c0)
+            if rev and op is not None:
+                return op / rev
+    except Exception:
+        pass
+    return None
+
+
+def _peer_margins(syms):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    now = time.time()
+    res, todo = {}, []
+    for s in syms:
+        c = _PEER_CACHE.get(s)
+        if c and now - c[0] < _FUND_TTL:
+            res[s] = c[1]
+        else:
+            todo.append(s)
+    if todo:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for s, m in zip(todo, ex.map(_operating_margin_of, todo)):
+                if m is not None:
+                    _PEER_CACHE[s] = (now, m)
+                    res[s] = m
+    return res
+
+
 def fetch_fundamentals(symbol):
     """財務指標を取得して (指標の辞書, 失敗理由) を返す。例外は外に出さない。"""
     import time
@@ -140,6 +212,27 @@ def fetch_fundamentals(symbol):
     except Exception as exc:
         errors.append(f"キャッシュフローの取得失敗（{type(exc).__name__}）")
 
+    # (3) 同業他社との営業利益率比較
+    if "operatingMargins" in out:
+        try:
+            gname, me, syms = _peer_group(symbol)
+            if gname:
+                peers = _peer_margins([s for s in syms if s != me])
+                if len(peers) >= 3:
+                    vals = sorted(peers.values())
+                    out["peerGroup"] = gname
+                    out["peerMedianMargin"] = float(np.median(vals))
+                    out["peerCount"] = float(len(vals))
+                    out["peerRank"] = float(1 + sum(1 for x in vals if x > out["operatingMargins"]))
+                    dom = [m for s, m in peers.items() if s.endswith(".T")]
+                    if len(dom) >= 2:
+                        out["peerDomesticMedian"] = float(np.median(dom))
+                    out["peerDetail"] = "、".join(
+                        f"{_PEER_NAMES.get(s, s)} {m * 100:.1f}%"
+                        for s, m in sorted(peers.items(), key=lambda kv: -kv[1]))
+        except Exception:
+            pass
+
     if out:
         _FUND_CACHE[symbol] = (time.time(), out)
         return out, ""
@@ -162,7 +255,13 @@ def _fund_agent(f, err=""):
 
     rows = []
     v = f.get("operatingMargins")
-    rows.append(("営業利益率", pct(v) if v is not None else None, None if v is None else v >= 0.10, "10%以上で良好"))
+    if v is not None and "peerMedianMargin" in f:
+        med = f["peerMedianMargin"]
+        n = int(f["peerCount"])
+        shown = f"{pct(v)}（{f['peerGroup']}・取得できた{n + 1}社中{int(f['peerRank'])}位、中央値{pct(med)}）"
+        rows.append(("営業利益率", shown, v >= med, "同業中央値以上で良好"))
+    else:
+        rows.append(("営業利益率", pct(v) if v is not None else None, None if v is None else v >= 0.10, "10%以上で良好（同業比較なし）"))
     v = f.get("returnOnEquity")
     rows.append(("ROE", pct(v) if v is not None else None, None if v is None else v >= 0.08, "8%以上で良好"))
     v = f.get("revenueGrowth")
@@ -187,6 +286,10 @@ def _fund_agent(f, err=""):
     if "priceToBook" in f:
         ref.append(f"PBR {f['priceToBook']:.2f}倍")
     ref_text = "参考：" + "、".join(ref) + "（点数には含めていません）。" if ref else ""
+    if "peerDomesticMedian" in f:
+        ref_text += f"国内メーカーのみの中央値は{pct(f['peerDomesticMedian'])}。"
+    if f.get("peerDetail"):
+        ref_text += f"他社の営業利益率：{f['peerDetail']}。"
 
     evaluable = [ok for _, _, ok, _ in rows if ok is not None]
     passed = sum(1 for ok in evaluable if ok)
@@ -332,4 +435,3 @@ MACDシグナル: {ctx['macd_signal']}
     except Exception as exc:
         result["summary"] += f"（AIコメント取得に失敗したため、ルール判定を表示しています：{type(exc).__name__}）"
     return result
-
